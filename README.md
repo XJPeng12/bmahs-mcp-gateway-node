@@ -14,7 +14,16 @@ BMAHS（比马斯）设备协议 ↔ MCP 网关的 **Node.js / TypeScript 实现
 - **两种接入模式**：stdio（单客户端）与 Streamable HTTP（多客户端共享，Bearer Token 常量时间鉴权，占用方可追溯到 `-sN` 会话）。
 - **实验性抓屏**：声明了 `ui` 能力的设备可 `bmahs_screenshot` 抓帧（§4.9 二进制流解析）。
 
-## 安装与构建
+## 安装
+
+```bash
+npm install -g bmahs-mcp-gateway-node       # 全局安装，得到命令 bmahs-mcp-node（与 pip 版的 bmahs-mcp 不冲突）
+npx -y bmahs-mcp-gateway-node@latest serve  # 免安装直接运行
+```
+
+验证：`bmahs-mcp-node --version` 输出 `bmahs-mcp-node 0.1.1`。要求 Node.js ≥ 20。国内网络安装慢可临时走镜像 `--registry=https://registry.npmmirror.com`（同步可能有几分钟延迟）。
+
+从源码构建开发：
 
 ```bash
 npm install
@@ -22,19 +31,18 @@ npm run build        # tsc → dist/
 node dist/bin.js --version
 ```
 
-全局安装后命令名为 `bmahs-mcp-node`（与 pip 版的 `bmahs-mcp` 不冲突）。
-
 ## 快速开始
 
-> 完整的下载、安装、MCP 客户端接入与排障说明见 [USAGE.md](USAGE.md)（两个版本通用）。
-
 ```bash
-# 扫描局域网内的 BMAHS 设备
+# 扫描局域网内的 BMAHS 设备（全局安装后把 node dist/bin.js 换成 bmahs-mcp-node）
 node dist/bin.js discover
 
-# 联调：对设备执行一个动作
+# 联调：对设备执行一个动作（控制类动作自动 occupy → 执行 → release）
 node dist/bin.js ctl 客厅灯 on
 node dist/bin.js ctl 客厅灯 brightness --arg level=80
+node dist/bin.js ctl 客厅灯 scene --arg name=cinema --ttl 600        # 指定占用租约 600 秒
+node dist/bin.js ctl 客厅灯 on --no-release                          # 动作后保持占用（打印 token）
+node dist/bin.js ctl 客厅灯 release --arg token=<占有时返回的 token>  # 手动释放保持的占用
 
 # 启动 MCP 网关（stdio，默认子命令）
 node dist/bin.js serve
@@ -57,6 +65,15 @@ node dist/bin.js http --host 0.0.0.0 --port 9530 --token 换成你的令牌
 ```
 
 HTTP 模式端点为 `http://<host>:9530/mcp`；设置了 `--token` 后客户端须携带 `Authorization: Bearer <token>`。
+
+重启客户端后，模型可见两类工具：**7 个固定工具**——`bmahs_devices`（列设备）、`bmahs_refresh`（重扫描）、`bmahs_describe`（读自述）、`bmahs_occupy` / `bmahs_release`（占用/释放）、`bmahs_call`（泛化调用）、`bmahs_screenshot`（ui 设备抓屏）；以及**每台设备的动态工具**——`<设备id>__<动作>`（如 `demo-light-001__brightness`），参数说明来自设备自述。典型流程：`bmahs_devices` 选型 → 直接调动态工具（网关自动 occupy 并携带 token，默认 120 秒租约）→ 用完 `bmahs_release`；token 由网关代管并遮蔽，不进模型上下文。
+
+## 常见问题
+
+- **扫不到设备？** 确认设备已上电且同网段、Windows 防火墙放行 UDP 5354 入站；多网卡机器用 `BMAHS_MCAST_IF_V4` 指定网卡；跨网段/容器用 `BMAHS_STATIC_DEVICES=tcp://IP:端口` 静态表兜底。
+- **报「正被 xxx 占用」（occupied）？** 设备独占中：`bmahs_devices` 看 `holder`/`until`，等租约到期或请占用方 `bmahs_release`；协议无强夺机制（防止两个模型打架）。
+- **HTTP 模式 401？** 请求头须带 `Authorization: Bearer <--token 设置的值>`。
+- **stdio 模式没有输出？** 正常：stdout 是 MCP 协议通道，日志全走 stderr（`BMAHS_LOG_LEVEL=debug` 调高）。
 
 ## 环境变量
 
@@ -84,8 +101,6 @@ npm run smoke:py  # 跨语言联调（拉起 ../examples/demo_light.py，需要�
 ```
 
 测试拓扑：`fake-device.ts` 是只实现控制层与 UI 流的测试假设备（不绑组播、状态可注入），与 Python 版 `tests/fake_device.py` 行为对齐。
-
-发布到 npm 的完整流程与注意事项见 [RELEASING.md](RELEASING.md)。
 
 ## 协议
 
