@@ -1,5 +1,7 @@
 # bmahs-mcp-gateway-node
 
+> **BMAHS（比马斯）** 是一个开放的局域网硬件协议：每台设备上电即用自然语言「自我介绍」——我是谁、能做什么、安全边界在哪——让大模型智能体像插 USB-C 一样，即插即用地发现、独占并安全地操作它们。
+
 BMAHS（比马斯）设备协议 ↔ MCP 网关的 **Node.js / TypeScript 实现**：把局域网内按 `bmahs/1.0` 协议发布的硬件设备（解析侧兼容旧版 1–1.2 字段名）动态映射为 [Model Context Protocol](https://modelcontextprotocol.io) 工具，让大模型客户端可以直接发现、占用与操作这些设备。
 
 与 Python 版（[bmahs-mcp-gateway](https://github.com/XJPeng12/bmahs-mcp-gateway)）功能全量对齐，两者可互换使用，也可与对方的参考设备跨语言互通（`npm run smoke:py`）。
