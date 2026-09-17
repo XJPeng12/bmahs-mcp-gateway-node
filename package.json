@@ -1,0 +1,48 @@
+{
+  "name": "bmahs-mcp-gateway-node",
+  "version": "0.1.0",
+  "description": "BMAHS（比马斯）设备协议 ↔ MCP 网关（Node/TypeScript 版）：发现并操作局域网内的 BMAHS 硬件设备",
+  "license": "MIT",
+  "author": "彭星杰",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "bmahs-mcp-node": "dist/bin.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "tsx test/smoke.ts",
+    "smoke:py": "tsx test/smoke-py.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "bmahs",
+    "mcp",
+    "iot",
+    "smart-home",
+    "zeroconf",
+    "llm",
+    "agent"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.13.0",
+    "bonjour-service": "^1.2.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^3.0.0"
+  }
+}
