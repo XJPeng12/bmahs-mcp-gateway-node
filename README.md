@@ -81,6 +81,8 @@ npm run smoke:py  # 跨语言联调（拉起 ../examples/demo_light.py，需要�
 
 测试拓扑：`fake-device.ts` 是只实现控制层与 UI 流的测试假设备（不绑组播、状态可注入），与 Python 版 `tests/fake_device.py` 行为对齐。
 
+发布到 npm 的完整流程与注意事项见 [RELEASING.md](RELEASING.md)。
+
 ## 协议
 
 完整协议文档见 Python 主仓库的 [docs/BMAHS.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS.md)：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连上先读 hello；网关在协议中承担「智能体」角色（§4.8）。
