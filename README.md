@@ -24,6 +24,8 @@ node dist/bin.js --version
 
 ## 快速开始
 
+> 完整的下载、安装、MCP 客户端接入与排障说明见 [USAGE.md](USAGE.md)（两个版本通用）。
+
 ```bash
 # 扫描局域网内的 BMAHS 设备
 node dist/bin.js discover
