@@ -2,7 +2,7 @@
 
 BMAHS（比马斯）设备协议 ↔ MCP 网关的 **Node.js / TypeScript 实现**：把局域网内按 `bmahs/1.0` 协议发布的硬件设备（解析侧兼容旧版 1–1.2 字段名）动态映射为 [Model Context Protocol](https://modelcontextprotocol.io) 工具，让大模型客户端可以直接发现、占用与操作这些设备。
 
-与 Python 版（[bmahs-mcp-gateway](../bmahs-mcp-gateway/)）功能全量对齐，两者可互换使用，也可与对方的参考设备跨语言互通（`npm run smoke:py`）。
+与 Python 版（[bmahs-mcp-gateway](https://github.com/XJPeng12/bmahs-mcp-gateway)）功能全量对齐，两者可互换使用，也可与对方的参考设备跨语言互通（`npm run smoke:py`）。
 
 ## 特性
 
@@ -83,7 +83,7 @@ npm run smoke:py  # 跨语言联调（拉起 ../examples/demo_light.py，需要�
 
 ## 协议
 
-完整协议文档见 [docs/BMAHS.md](../docs/BMAHS.md)（仓库根）：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连上先读 hello；网关在协议中承担「智能体」角色（§4.8）。
+完整协议文档见 Python 主仓库的 [docs/BMAHS.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS.md)：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连上先读 hello；网关在协议中承担「智能体」角色（§4.8）。
 
 ## License
 
