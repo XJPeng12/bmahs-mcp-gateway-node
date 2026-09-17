@@ -240,7 +240,9 @@ export class Gateway {
       const now_mono = monotonic();
       for (const dev of this.discovery.all()) {
         if (dev.hello !== null) continue;
-        if (now_mono - dev.hello_fail_at < HELLO_RETRY_SEC) continue;
+        // monotonic() 是进程启动起的秒数，hello_fail_at=0 表示从未失败；
+        // 不排除 0 的话进程启动后前 30 秒所有设备都会被误判为退避中
+        if (dev.hello_fail_at > 0 && now_mono - dev.hello_fail_at < HELLO_RETRY_SEC) continue;
         try {
           await this.hello_sema.run(() => this.refresh_hello(dev));
           changed = true;
