@@ -104,7 +104,7 @@ npm run smoke:py  # 跨语言联调（拉起 ../examples/demo_light.py，需要�
 
 ## 协议
 
-完整协议文档见 Python 主仓库的 [docs/BMAHS.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS.md)：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连上先读 hello；网关在协议中承担「智能体」角色（§4.8）。
+完整协议文档见 Python 主仓库的 [docs/BMAHS1.0.md](https://github.com/XJPeng12/bmahs-mcp-gateway/blob/main/docs/BMAHS1.0.md)：UDP 组播一报文一 JSON（≤1400 字节）负责发现，TCP 一行 JSON + `\n` 负责控制，连上先读 hello；网关在协议中承担「智能体」角色（§4.8）。
 
 ## License
 
