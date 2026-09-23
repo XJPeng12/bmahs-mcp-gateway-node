@@ -243,3 +243,43 @@ describe("杂项", () => {
     expect(gw.agent_for(k1)).toBe(`${gw.agent_id}-s1`);
   });
 });
+
+describe("id 冲突处置策略（BMAHS_ID_CONFLICT_POLICY）", () => {
+  function mark_conflict(gw: Gateway, dev_id: string): void {
+    const dev = gw.discovery.get(dev_id)!;
+    dev.id_conflict = true;
+    dev.controls_seen = new Map([
+      ["tcp://192.168.1.4:9527", [0, ""]],
+      ["tcp://10.0.0.8:9527", [0, ""]],
+    ]);
+  }
+
+  it("warn：标记设备与工具描述警示，控制照常放行", async () => {
+    const { gw, dev } = await make_gw();
+    await prime(gw, dev);
+    mark_conflict(gw, dev.device_id);
+    const out = await gw.tool_devices();
+    const item = out.devices.find((d) => d.id === dev.device_id)!;
+    expect(item.id_conflict).toBe(true);
+    expect((item.conflict_controls as string[]).length).toBe(2);
+    const tools = gw.list_tools().filter((t) => t.name.startsWith(dev.device_id));
+    expect(tools.length).toBeGreaterThan(0);
+    for (const t of tools) expect(t.description).toContain("疑似 id 冲突");
+    const res = await gw.call_tool(`${dev.device_id}__on`, {}, "local");
+    expect(res).toBeTruthy();
+  });
+
+  it("isolate：隐藏动态工具并拒绝控制类调用，只读放行", async () => {
+    const { gw, dev } = await make_gw();
+    await prime(gw, dev);
+    mark_conflict(gw, dev.device_id);
+    gw.id_conflict_policy = "isolate";
+    gw.rebuild_tools();
+    const names = gw.list_tools().map((t) => t.name);
+    expect(names.some((n) => n.startsWith(dev.device_id))).toBe(false);
+    await expect(gw.call_tool("bmahs_call", { device: dev.device_id, action: "on" }, "local")).rejects.toThrow(/id 冲突/);
+    await expect(gw.call_tool("bmahs_occupy", { device: dev.device_id }, "local")).rejects.toThrow(/id 冲突/);
+    const res = await gw.call_tool("bmahs_describe", { device: dev.device_id }, "local");
+    expect(res).toBeTruthy();
+  });
+});

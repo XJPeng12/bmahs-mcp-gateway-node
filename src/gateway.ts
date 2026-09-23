@@ -176,6 +176,8 @@ export class Gateway {
   discovery: Discovery;
   tool_allow: string[];
   tool_deny: string[];
+  /** id 冲突处置策略（docs/设备id冲突-现状与改进.md §5.1） */
+  id_conflict_policy: "warn" | "isolate" | "off";
   /** 占用 token 按会话隔离：stdio 单会话用 "local"；HTTP 模式每个 MCP 会话一个键
    * （s1/s2…），占用方显示为 <agent_id>-sN，可追溯到对话会话。仅内存，不落盘。 */
   tokens: Map<string, Map<string, string>> = new Map();
@@ -204,11 +206,19 @@ export class Gateway {
       .map((s) => s.trim())
       .filter((s) => s.length > 0);
     this.capture_dir = process.env.BMAHS_CAPTURE_DIR || path.join(tmpdir(), "bmahs_captures");
+    // id 冲突处置策略：warn=标记+告警+工具描述警示（默认，兼容多网卡设备的持续
+    // 误报源）；isolate=冲突设备不生成动态工具且拒绝控制类调用；off=完全不检测
+    const conflict_policy = (process.env.BMAHS_ID_CONFLICT_POLICY ?? "warn")
+      .trim()
+      .toLowerCase();
+    this.id_conflict_policy =
+      conflict_policy === "isolate" || conflict_policy === "off" ? conflict_policy : "warn";
     this.discovery = new Discovery(this.agent_id, {
       query_interval: env_float("BMAHS_QUERY_INTERVAL", 300),
       expire_sec: env_float("BMAHS_EXPIRE_SEC", 1800),
       static_uris,
       bonjour: env_bool("BMAHS_BONJOUR_BROWSE", true),
+      conflict_detect: this.id_conflict_policy !== "off",
       on_change: () => this.on_devices_changed(),
     });
     // 工具暴露过滤：BMAHS_TOOL_ALLOW / BMAHS_TOOL_DENY，逗号分隔通配符，
@@ -421,6 +431,7 @@ export class Gateway {
     for (const dev of [...this.discovery.all()].sort((a, b) => (a.id < b.id ? -1 : 1))) {
       const hello = dev.hello;
       if (!hello) continue;
+      if (this.id_conflict_policy === "isolate" && dev.id_conflict) continue; // isolate：疑似 id 冲突不暴露动态工具
       const ops = (hello.operations ?? hello.ops ?? []) as unknown[];
       for (const op_raw of ops) {
         if (typeof op_raw !== "object" || op_raw === null) continue;
@@ -531,7 +542,18 @@ export class Gateway {
    * ttl 缺省用自动占用租约，超上限截断；已持有 token 时带上它以刷新租约，
    * token 失效则去掉重占一次。
    */
+  /** isolate 策略下拒绝与疑似 id 冲突设备的控制交互；只读动作放行，便于诊断。 */
+  private guard_conflict(dev: Device): void {
+    if (this.id_conflict_policy !== "isolate" || !dev.id_conflict) return;
+    const controls = [...dev.controls_seen.keys()].sort().join("、") || "多个地址";
+    throw new GatewayError(
+      `设备 ${dev.id} 疑似 id 冲突（局域网内多个控制地址自称 ${dev.id}，观测到 ${controls}），` +
+        "已按 BMAHS_ID_CONFLICT_POLICY=isolate 隔离控制类动作；请人工核实并修改重复的设备 id 后重试",
+    );
+  }
+
   async occupy(dev: Device, ttl: unknown = null, skey = "local"): Promise<BmahsMessage> {
+    this.guard_conflict(dev);
     const agent = this.agent_for(skey);
     const payload: BmahsMessage = { action: "occupy", agent };
     // 网关租约策略：不允许无限期占用。不带 ttl 用默认有限租约（120s），
@@ -595,6 +617,7 @@ export class Gateway {
       const [, resp] = await this.raw_call(dev, { action, agent: this.agent_for(skey), ...extras });
       return resp;
     }
+    this.guard_conflict(dev);
     let token = this.token(skey, dev.id);
     if (token === null) {
       if (!this.auto_occupy) {
@@ -725,9 +748,15 @@ export class Gateway {
       if (!dev?.hello) continue;
       const op = find_op(dev.hello, action);
       if (!op) continue;
+      let description = tool_description(dev.hello, op);
+      if (dev.id_conflict && this.id_conflict_policy === "warn") {
+        description +=
+          "\n⚠️ 该设备 id 在局域网内观测到多个控制地址（疑似 id 冲突），" +
+          "控制结果可能并非总是命中同一台实体设备，建议人工核实后再依赖。";
+      }
       tools.push({
         name,
-        description: tool_description(dev.hello, op),
+        description,
         inputSchema: input_schema(op),
       });
     }
@@ -823,6 +852,8 @@ export class Gateway {
         until: dev.until || null,
         occupied_by_gateway: [...this.tokens.values()].some((toks) => toks.has(dev.id)),
         control: dev.uri,
+        id_conflict: dev.id_conflict,
+        conflict_controls: dev.id_conflict ? [...dev.controls_seen.keys()].sort() : [],
         model: hello.model ?? dev.announce.model ?? "",
         last_seen_age_sec: dev.last_seen ? Math.max(0, now_s - dev.last_seen) : null,
         source: dev.source,
@@ -837,7 +868,9 @@ export class Gateway {
       devices: items,
       note:
         "控制类动作前网关会自动 occupy（默认 120 秒有限租约，可用 BMAHS_AUTO_OCCUPY_TTL 调整）并携带 token；" +
-        "任务结束请 bmahs_release。ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。",
+        "任务结束请 bmahs_release。ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。" +
+        "id_conflict=true 的设备：局域网内观测到多个控制地址自称同一 id（可能是两台设备撞 id，" +
+        "也可能是同一设备多网卡），控制结果可能不确定，建议先人工核实。",
     };
   }
 

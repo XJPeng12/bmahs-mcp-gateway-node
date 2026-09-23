@@ -35,6 +35,10 @@ import { get_logger } from "./logging.js";
 /** 简易 stderr 日志（网关以 stdio 运行时绝不能打印 stdout）。 */
 const log = get_logger("discovery");
 
+/** id 冲突判定的活跃窗口（秒）：稳态 announce 间隔 5s 是协议硬性下限（§15），
+ *  60s = 12 个心跳；正常换 IP（§3.3）的旧地址会在一个窗口后自动衰减出判定。 */
+const ID_CONFLICT_WINDOW = 60.0;
+
 /** 注册表中的一台设备。动态设备以 announce.id 为键；静态/Bonjour 设备
  * 初始以 `static:host:port` / 设备 id（或 `bonjour:host:port` 过渡键）入库，
  * 读到 hello 后统一重键为设备 id。 */
@@ -54,6 +58,11 @@ export class Device {
   static_uri: string | null = null;
   /** Bonjour 浏览登记的 tcp://host:port；该通道设备的生命周期由 mDNS 记录增删驱动，不参与心跳过期 */
   bonjour_uri: string | null = null;
+  /** 同 id 多地址观测（id 冲突检测，docs/设备id冲突-现状与改进.md §4）：
+   *  control -> (最近一次该 control 的广播时刻 Unix 秒, model)；检测关闭时不记录 */
+  controls_seen = new Map<string, [number, string]>();
+  /** 活跃窗口内观测到 ≥2 个不同 control：疑似两台设备撞 id，或同一设备的多网卡多地址 */
+  id_conflict = false;
 
   constructor(public key: string) {}
 
@@ -102,6 +111,17 @@ export class Device {
     if (this.static_uri) return "static";
     return this.bonjour_uri ? "bonjour" : "multicast";
   }
+
+  /** 活跃窗口（秒）内是否观测到 ≥2 个不同 control：同 id 冲突信号。
+   *  窗口外的地址条目顺带清理。正常换 IP（§3.3）的旧地址一个窗口后自动衰减、
+   *  冲突解除；同一设备的多网卡多地址会持续命中（误报源），处置交由网关层策略。 */
+  eval_id_conflict(window: number): boolean {
+    const now_s = now();
+    for (const [c, v] of this.controls_seen) {
+      if (now_s - v[0] > window) this.controls_seen.delete(c);
+    }
+    return this.controls_seen.size >= 2;
+  }
 }
 
 function monotonic(): number {
@@ -113,6 +133,8 @@ export interface DiscoveryOptions {
   expire_sec?: number;
   static_uris?: string[];
   bonjour?: boolean;
+  /** 是否检测同 id 多控制地址（id 冲突）；关闭时不记录 controls_seen */
+  conflict_detect?: boolean;
   on_change?: () => Promise<void> | void;
 }
 
@@ -122,6 +144,8 @@ export class Discovery {
   expire_sec: number;
   static_uris: string[];
   bonjour: boolean;
+  /** 是否检测同 id 多控制地址（id 冲突）；关闭时不记录 controls_seen */
+  conflict_detect: boolean;
   on_change: (() => Promise<void> | void) | null;
   /** 注册表：key -> Device；设备的增删与状态更新都发生在这里 */
   devices = new Map<string, Device>();
@@ -149,6 +173,7 @@ export class Discovery {
     this.expire_sec = Math.max(60.0, opts.expire_sec ?? 1800.0);
     this.static_uris = opts.static_uris ?? [];
     this.bonjour = opts.bonjour ?? true;
+    this.conflict_detect = opts.conflict_detect ?? true;
     this.on_change = opts.on_change ?? null;
     this.v4_addrs = local_v4_addrs();
   }
@@ -367,8 +392,32 @@ export class Discovery {
       dev.announce.control !== msg.control || dev.announce.state !== msg.state;
     dev.announce = msg;
     dev.last_seen = now();
-    return is_new || changed;
+    return this.track_conflict(dev) || is_new || changed;
   }
+
+  /** 记录本条 announce 的 control 指纹并评估 id 冲突；标记翻转时打日志。
+   *  返回 true 表示冲突标记发生变化（调用方应触发 on_change 重建工具表）。 */
+  private track_conflict(dev: Device): boolean {
+    if (!this.conflict_detect) return false;
+    const control = typeof dev.announce.control === "string" ? dev.announce.control : "";
+    if (control) {
+      const model = typeof dev.announce.model === "string" ? dev.announce.model : "";
+      dev.controls_seen.set(control, [now(), model]);
+    }
+    const was = dev.id_conflict;
+    dev.id_conflict = dev.eval_id_conflict(ID_CONFLICT_WINDOW);
+    if (dev.id_conflict && !was) {
+      log.warn(
+        `设备 id 冲突告警：${dev.id} 在 ${Math.round(ID_CONFLICT_WINDOW)} 秒窗口内观测到多个控制地址` +
+          `（${[...dev.controls_seen.keys()].sort().join("、")}）——可能是两台设备撞 id（控制会串台），` +
+          `也可能是同一设备的多网卡多地址；处置策略见 BMAHS_ID_CONFLICT_POLICY`,
+      );
+    } else if (was && !dev.id_conflict) {
+      log.info(`设备 ${dev.id} 的 id 冲突已解除（活跃窗口内仅剩单一控制地址）`);
+    }
+    return dev.id_conflict !== was;
+  }
+
 
   /** 把设备移出注册表（goodbye 下线）；静态设备不删（登记值仍在，重连即恢复）。 */
   private remove(dev_id: string): boolean {

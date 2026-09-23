@@ -240,3 +240,48 @@ describe("local_v4_addrs", () => {
     expect(addrs).not.toContain("127.0.0.1");
   });
 });
+
+describe("同 id 多控制地址检测（id 冲突）", () => {
+  it("两个 control 标记冲突；窗口衰减后重评解除", () => {
+    const disc = make_disc();
+    feed(disc, announce_msg({ control: "tcp://192.168.1.10:9527" }));
+    const dev = disc.get("light-1")!;
+    expect(dev.id_conflict).toBe(false);
+    feed(disc, announce_msg({ control: "tcp://10.0.0.8:9527" }));
+    expect(dev.id_conflict).toBe(true);
+    expect([...dev.controls_seen.keys()].sort()).toEqual([
+      "tcp://10.0.0.8:9527",
+      "tcp://192.168.1.10:9527",
+    ]);
+    // 旧地址回拨出 60s 窗口 → 下一条 announce 的重评解除冲突并清理条目
+    const stale = dev.controls_seen.get("tcp://192.168.1.10:9527")!;
+    dev.controls_seen.set("tcp://192.168.1.10:9527", [stale[0] - 3600, stale[1]]);
+    feed(disc, announce_msg({ control: "tcp://10.0.0.8:9527" }));
+    expect(dev.id_conflict).toBe(false);
+    expect([...dev.controls_seen.keys()]).toEqual(["tcp://10.0.0.8:9527"]);
+  });
+
+  it("conflict_detect=false 不记录不标记", () => {
+    const disc = make_disc({ conflict_detect: false });
+    feed(disc, announce_msg({ control: "tcp://192.168.1.10:9527" }));
+    feed(disc, announce_msg({ control: "tcp://10.0.0.8:9527" }));
+    const dev = disc.get("light-1")!;
+    expect(dev.id_conflict).toBe(false);
+    expect(dev.controls_seen.size).toBe(0);
+  });
+
+  it("冲突翻转触发 on_change（工具表重建入口）", async () => {
+    const disc = make_disc();
+    let changes = 0;
+    disc.on_change = () => {
+      changes += 1;
+    };
+    feed(disc, announce_msg({ control: "tcp://192.168.1.10:9527" }));
+    await Promise.resolve();
+    await Promise.resolve();
+    feed(disc, announce_msg({ control: "tcp://10.0.0.8:9527" }));
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(changes).toBeGreaterThanOrEqual(2);
+  });
+});
