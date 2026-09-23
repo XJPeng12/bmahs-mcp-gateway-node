@@ -24,7 +24,11 @@ const INSTRUCTIONS =
   "「<设备id>__<动作>」形式的工具，工具说明含设备的自然语言自述与安全边界。" +
   "先用 bmahs_devices 查看设备并按 name/summary 选型；控制类动作网关会自动" +
   "occupy 并携带 token；任务结束（含失败/取消）必须 bmahs_release，" +
-  "否则设备会一直对其它智能体显示被占用。";
+  "否则设备会一直对其它智能体显示被占用。" +
+  "填参守则：所有工具的 device 参数直接填设备 id 字符串本身（如 \"lamp-01\"），" +
+  "不要传对象或 {id: 名称} 映射；数值参数按 schema 类型传（整数不要加引号）。" +
+  "同一调用失败时不要原样重试：按错误信息里的 retry_with/hint 修正参数，" +
+  "连续失败请改用其他工具或向用户求助。";
 
 /** 装配一个 MCP Server（对应一条传输/一个会话）。
  *
@@ -64,11 +68,14 @@ export function build_server(gw: Gateway, handle: object | null, notify: () => P
         };
       }
       if (e instanceof GatewayError) {
+        // 优先用富错误信封（echo/retry_with/candidates，参数净化与防循环守卫
+        // 附加字段都在里面），没有信封时退回纯文本格式
+        const payload = e.envelope ?? { ok: false, code: "gateway", error: String(e) };
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({ ok: false, code: "gateway", error: String(e) }, null, 2),
+              text: JSON.stringify(payload, null, 2),
             },
           ],
           isError: true,

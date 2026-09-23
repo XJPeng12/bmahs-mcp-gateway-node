@@ -1,6 +1,6 @@
 {
   "name": "bmahs-mcp-gateway-node",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "BMAHS（比马斯）设备协议 ↔ MCP 网关（Node/TypeScript 版）：发现并操作局域网内的 BMAHS 硬件设备",
   "license": "MIT",
   "author": "pengxingjie",

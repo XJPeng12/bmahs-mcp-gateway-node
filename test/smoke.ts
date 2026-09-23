@@ -177,12 +177,14 @@ async function main(): Promise<number> {
     if (!call.isError && json_of(call).level === 80) ok("bmahs_call 泛化调用（释放后自动重新占用）");
     else throw new Error(`call 失败：${text_of(call)}`);
 
-    // 14. 清单外动作
+    // 14. 清单外动作（防线②：网关拦截并给出 echo + retry_with + 候选清单，不到设备）
     const unknown = (await capture(
       client.callTool({ name: "bmahs_call", arguments: { device: "demo-light-001", action: "reboot" } }),
     )) as ToolResult;
-    if (unknown.isError && json_of(unknown).code === "unknown-action") ok("清单外动作 → unknown-action 信封");
-    else throw new Error(`unknown-action 异常：${text_of(unknown)}`);
+    const unk = json_of(unknown);
+    if (unknown.isError && unk.code === "bad-arg" && unk.echo && unk.retry_with && unk.candidates)
+      ok("清单外动作 → 网关 bad-arg 信封（echo + retry_with + 候选清单）");
+    else throw new Error(`清单外动作异常：${text_of(unknown)}`);
 
     // 15. 最终 bmahs_release
     const final_release = (await capture(

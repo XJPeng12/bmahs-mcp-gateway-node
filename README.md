@@ -91,6 +91,10 @@ HTTP 模式端点为 `http://<host>:9530/mcp`；设置了 `--token` 后客户端
 | `BMAHS_MCAST_IF_V4` | 自动枚举 | 手动指定组播网卡（逗号分隔本机 IPv4） |
 | `BMAHS_HTTP_HOST` / `BMAHS_HTTP_PORT` / `BMAHS_HTTP_PATH` / `BMAHS_HTTP_TOKEN` | `0.0.0.0` / `9530` / `/mcp` / 无 | HTTP 模式默认参数 |
 | `BMAHS_LOG_LEVEL` | `info` | 日志级别（一律走 stderr） |
+| `BMAHS_ARG_COERCE` | `1` | 参数净化器（防线②）：device 传成对象自动解包、字符串数字转声明类型、id/动作名近似矫正；`0` 关闭 |
+| `BMAHS_LOOP_GUARD` / `BMAHS_LOOP_GUARD_MAX` | `1` / `3` | 防循环守卫（防线③）：同一工具同参连续失败第 2 次升级提示、第 N 次下达停止令 |
+| `BMAHS_DESCRIBE_OPTIONAL` | `1` | bmahs_describe 的 device 可选（唯一设备自动选中，多台返回选择清单） |
+| `BMAHS_DEVICE_TOOLS` | `0` | 备用：为每台设备生成零参数 `<id>__describe` 动态别名 |
 
 ## 开发与测试
 

@@ -19,10 +19,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import * as client from "./client.js";
 import { Discovery, type Device } from "./discovery.js";
 import { get_logger } from "./logging.js";
+import * as sanitize from "./sanitize.js";
 import {
   GENERIC_ACTIONS,
   LEASE_UNLIMITED,
@@ -45,10 +46,20 @@ const HELLO_STALE_SEC = 300.0;
 /** hello 读取失败后的重试退避间隔（秒），避免对离线设备疯狂建连 */
 const HELLO_RETRY_SEC = 30.0;
 
+/** BMAHS_DEVICE_TOOLS=1 时为每台设备生成的零参数 describe 别名的动作定义
+ * （通用动作不在各设备 operations 里重复出现，动态别名需要一份描述来源）。 */
+const DESCRIBE_OP: Op = {
+  name: "describe",
+  description: "读取该设备的完整操作清单（operations）、安全边界（security）与自然语言自述。",
+};
+
 export class GatewayError extends Error {
-  constructor(message: string) {
+  /** 富错误信封（echo/retry_with/candidates，见 sanitize.ts），server 层优先用它 */
+  envelope?: Record<string, unknown>;
+  constructor(message: string, envelope?: Record<string, unknown>) {
     super(message);
     this.name = "GatewayError";
+    this.envelope = envelope;
   }
 }
 
@@ -178,6 +189,17 @@ export class Gateway {
   tool_deny: string[];
   /** id 冲突处置策略（docs/设备id冲突-现状与改进.md §5.1） */
   id_conflict_policy: "warn" | "isolate" | "off";
+  // —— 工具调用参数死循环防护（docs/工具调用参数死循环_网关侧防护方案.md）——
+  /** 防线②：参数净化器（dict 解包 / 字符串数字转类型 / 近似匹配），BMAHS_ARG_COERCE=0 关闭 */
+  arg_coerce: boolean;
+  /** 防线③：同参重复失败升级提示开关 */
+  loop_guard: boolean;
+  /** 防线③：第 N 次连续同参失败时下达停止令（下限 2） */
+  loop_guard_max: number;
+  /** 防线①：bmahs_describe 的 device 可选（唯一设备自动选中；多设备返回选择清单） */
+  describe_optional: boolean;
+  /** 备用方案：为每台设备生成零参数 <id>__describe 动态别名（工具表膨胀，默认关） */
+  device_describe_tools: boolean;
   /** 占用 token 按会话隔离：stdio 单会话用 "local"；HTTP 模式每个 MCP 会话一个键
    * （s1/s2…），占用方显示为 <agent_id>-sN，可追溯到对话会话。仅内存，不落盘。 */
   tokens: Map<string, Map<string, string>> = new Map();
@@ -190,6 +212,9 @@ export class Gateway {
   private tools_sig = "";
   private hello_sema = new Semaphore(8);
   private hello_timer: NodeJS.Timeout | null = null;
+  /** 防线③状态：skey -> 最近一次失败 (指纹, 连续次数, 时刻)；任何成功调用即清除。
+   * 只记「最近一次」：威胁不是历史累计失败，而是连续原样重放，换调用即重置。 */
+  private fail_streak = new Map<string, [string, number, number]>();
 
   constructor() {
     this.agent_id =
@@ -225,6 +250,13 @@ export class Gateway {
     // 匹配动态工具名 / 「设备id__动作」/ 纯动作名；deny 优先，只作用于动态工具
     this.tool_allow = Gateway.patterns("BMAHS_TOOL_ALLOW");
     this.tool_deny = Gateway.patterns("BMAHS_TOOL_DENY");
+    // —— 工具调用参数死循环防护 ——
+    this.arg_coerce = env_bool("BMAHS_ARG_COERCE", true);
+    this.loop_guard = env_bool("BMAHS_LOOP_GUARD", true);
+    this.loop_guard_max = Math.max(2, env_int("BMAHS_LOOP_GUARD_MAX", 3));
+    this.describe_optional = env_bool("BMAHS_DESCRIBE_OPTIONAL", true);
+    const ddt = (process.env.BMAHS_DEVICE_TOOLS ?? "").trim().toLowerCase();
+    this.device_describe_tools = ddt === "1" || ddt === "true" || ddt === "yes";
   }
 
   private static patterns(env: string): string[] {
@@ -451,6 +483,23 @@ export class Gateway {
         const desc_hash = djb2_hash(tool_description(hello, op)) & 0xffffff;
         sig_parts.push(`${name}:${desc_hash}`);
       }
+      if (this.device_describe_tools) {
+        // 备用方案（BMAHS_DEVICE_TOOLS=1）：零参数 <id>__describe 别名，
+        // 把「查详情必须手填 device」这个参数从工具面上消灭
+        let name = mcp_tool_name(dev.id, "describe");
+        const base = name;
+        let n = 2;
+        while (mapping.has(name) && mapping.get(name)!.join("|") !== `${dev.id}|describe`) {
+          const suffix = `-${n}`;
+          name = base.slice(0, 64 - suffix.length) + suffix;
+          n += 1;
+        }
+        if (!this.tool_hidden(name, dev.id, "describe")) {
+          mapping.set(name, [dev.id, "describe"]);
+          const desc_hash = djb2_hash(tool_description(hello, { ...DESCRIBE_OP })) & 0xffffff;
+          sig_parts.push(`${name}:${desc_hash}`);
+        }
+      }
     }
     const sig = sig_parts.sort().join("|");
     const changed = sig !== this.tools_sig;
@@ -461,12 +510,10 @@ export class Gateway {
 
   // ------------------------------------------------------------------ 设备解析与控制
 
-  /** 把模型给的设备引用解析为 Device：先按 id 精确匹配 → 唯一同名 → 唯一子串模糊匹配。 */
-  resolve_device(ref: unknown): Device {
+  /** resolve_device 的不抛错版：id 精确 → 唯一同名 → 唯一子串；落空返回 null。 */
+  resolve_quiet(ref: unknown): Device | null {
     const r = String(ref ?? "").trim();
-    if (!r) {
-      throw new GatewayError("未指定设备（请传设备 id 或显示名，可先用 bmahs_devices 查询）");
-    }
+    if (!r) return null;
     let dev = this.discovery.get(r);
     if (dev === null) {
       const named = this.discovery.all().filter((d) => d.name === r);
@@ -479,12 +526,31 @@ export class Gateway {
         .filter((d) => d.id.toLowerCase().includes(needle) || d.name.toLowerCase().includes(needle));
       if (fuzzy.length === 1) dev = fuzzy[0]!;
     }
+    return dev;
+  }
+
+  /** 把模型给的设备引用解析为 Device：先按 id 精确匹配 → 唯一同名 → 唯一子串模糊匹配。
+   *
+   * 三级都落空时抛带富错误信封的 GatewayError（echo 回显实际传参、retry_with
+   * 给示例 id、candidates 列出当前已知设备），引导模型下一轮照抄正确形态。
+   */
+  resolve_device(ref: unknown): Device {
+    const r = String(ref ?? "").trim();
+    if (!r) {
+      throw new GatewayError("未指定设备（请传设备 id 或显示名，可先用 bmahs_devices 查询）");
+    }
+    const dev = this.resolve_quiet(r);
     if (dev === null) {
-      const known = this.discovery
-        .all()
-        .map((d) => `${d.id}（${d.name}）`);
+      const known = this.discovery.all().map((d) => `${d.id}（${d.name}）`);
       const listing = known.length > 0 ? known.join("；") : "（局域网内暂无设备，可调用 bmahs_refresh 重新扫描）";
-      throw new GatewayError(`找不到设备 ${JSON.stringify(r)}。当前已知设备：${listing}`);
+      throw new GatewayError(
+        `找不到设备 ${JSON.stringify(r)}。当前已知设备：${listing}`,
+        sanitize.rich_error(`找不到设备 ${JSON.stringify(r)}。当前已知设备：${listing}`, {
+          echo: { device: r },
+          retry_with: known.length > 0 ? { device: sanitize.example_device_ref(this) } : undefined,
+          candidates: known.length > 0 ? sanitize.known_device_list(this) : undefined,
+        }),
+      );
     }
     return dev;
   }
@@ -645,8 +711,17 @@ export class Gateway {
 
   // ------------------------------------------------------------------ MCP: list_tools
 
-  /** 组装 MCP 工具表：7 个固定工具 + 每台设备的每个非通用动作一个动态工具。 */
+  /** 组装 MCP 工具表：7 个固定工具 + 每台设备的每个非通用动作一个动态工具。
+   *
+   * 防线①（docs/工具调用参数死循环_网关侧防护方案.md §4）：device 参数描述带
+   * 可照抄的字面量正例 + 负例（示例 id 取当前真实设备），从源头压低首错率。
+   */
   list_tools(): ToolDef[] {
+    const example = sanitize.example_device_ref(this);
+    const device_desc =
+      "设备 id 或显示名。必须直接填字符串本身，如 " +
+      `${JSON.stringify(example)}；禁止传对象、禁止传 ` +
+      `{${JSON.stringify(example)}: "设备名"} 这类 {id: 名称} 映射。`;
     const tools: ToolDef[] = [
       {
         name: "bmahs_devices",
@@ -670,11 +745,13 @@ export class Gateway {
       },
       {
         name: "bmahs_describe",
-        description: "读取某台 BMAHS 设备的完整操作清单（operations）、安全边界（security）与自然语言自述。",
+        description:
+          "读取某台 BMAHS 设备的完整操作清单（operations）、安全边界（security）与自然语言自述。" +
+          `device 直接填 id 字符串（如 ${JSON.stringify(example)}）；局域网内只有一台已知设备时可省略 device。`,
         inputSchema: {
           type: "object",
-          properties: { device: { type: "string", description: "设备 id 或显示名" } },
-          required: ["device"],
+          properties: { device: { type: "string", description: device_desc } },
+          ...(this.describe_optional ? {} : { required: ["device"] }),
           additionalProperties: false,
         },
         annotations: { readOnlyHint: true },
@@ -686,7 +763,7 @@ export class Gateway {
         inputSchema: {
           type: "object",
           properties: {
-            device: { type: "string", description: "设备 id 或显示名" },
+            device: { type: "string", description: device_desc },
             ttl: {
               type: "integer",
               minimum: 10,
@@ -704,7 +781,7 @@ export class Gateway {
           "释放对某台 BMAHS 设备的占用。任务结束、失败或取消后必须调用，否则其它智能体会一直收到「被占用」。",
         inputSchema: {
           type: "object",
-          properties: { device: { type: "string", description: "设备 id 或显示名" } },
+          properties: { device: { type: "string", description: device_desc } },
           required: ["device"],
           additionalProperties: false,
         },
@@ -716,9 +793,14 @@ export class Gateway {
         inputSchema: {
           type: "object",
           properties: {
-            device: { type: "string", description: "设备 id 或显示名" },
+            device: { type: "string", description: device_desc },
             action: { type: "string", description: "动作名，必须在设备 operations 清单中" },
-            args: { type: "object", description: "动作参数（按该设备 operations 中该动作 args 的字段名与类型）" },
+            args: {
+              type: "object",
+              description:
+                "动作参数对象，键=参数名，值类型按该设备 operations 中该动作 args 的声明。" +
+                '示例：亮度动作传 {"brightness": 50}（整数），不要传 {"brightness": "50"}，不要传数组。',
+            },
           },
           required: ["device", "action"],
           additionalProperties: false,
@@ -731,7 +813,7 @@ export class Gateway {
         inputSchema: {
           type: "object",
           properties: {
-            device: { type: "string", description: "设备 id 或显示名" },
+            device: { type: "string", description: device_desc },
             max_width: {
               type: "integer",
               minimum: 64,
@@ -746,7 +828,7 @@ export class Gateway {
     for (const [name, [dev_id, action]] of [...this.tool_map.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
       const dev = this.discovery.get(dev_id);
       if (!dev?.hello) continue;
-      const op = find_op(dev.hello, action);
+      const op = find_op(dev.hello, action) ?? (action === "describe" ? { ...DESCRIBE_OP } : null);
       if (!op) continue;
       let description = tool_description(dev.hello, op);
       if (dev.id_conflict && this.id_conflict_policy === "warn") {
@@ -765,44 +847,232 @@ export class Gateway {
 
   // ------------------------------------------------------------------ MCP: call_tool
 
-  /** MCP 工具调用总入口：先路由固定工具，再按 tool_map 路由到具体设备动作。
+  /** MCP 工具调用总入口：参数净化（防线②）→ 分发执行 → 错误统一过防循环守卫（防线③）。
    *
    * 动态动作执行前校验 any_of（至少提供一个参数）约束；所有响应经 mask
-   * 遮蔽 token、经 require_ok 校验后以文本内容返回。
+   * 遮蔽 token、经 require_ok 校验后以文本内容返回；任何成功调用都会重置
+   * 该会话的「连续同参失败」计数。
    */
   async call_tool(name: string, args: Record<string, unknown> | null, skey = "local"): Promise<ContentBlock[]> {
     const arguments_ = { ...(args ?? {}) };
+    try {
+      const result = await this.dispatch_tool(name, arguments_, skey);
+      this.fail_streak.delete(skey);
+      return result;
+    } catch (e) {
+      if (e instanceof DeviceEnvelope) {
+        e.envelope = this.guarded_error(skey, name, arguments_, e.envelope);
+      } else if (e instanceof GatewayError) {
+        const env = e.envelope ?? { ok: false, code: "gateway", error: String(e), retryable: false };
+        e.envelope = this.guarded_error(skey, name, arguments_, env as Record<string, unknown>);
+      }
+      throw e;
+    }
+  }
+
+  /** 防线②：净化 device 参数（BMAHS_ARG_COERCE=0 时原样透传）。 */
+  private prep_device(args: Record<string, unknown>): [unknown, sanitize.CoercedNote[], sanitize.SanitizeError | null] {
+    const value = args.device;
+    if (!this.arg_coerce) return [value, [], null];
+    return sanitize.coerce_device_ref(this, value);
+  }
+
+  /** 成功响应附 coerced 透明标注（防线②原则 2：让模型知道被矫正了什么）。 */
+  private static attach_coerced(resp: BmahsMessage, notes: sanitize.CoercedNote[]): BmahsMessage {
+    if (notes.length > 0 && resp && typeof resp === "object" && !Array.isArray(resp)) {
+      return { ...resp, coerced: notes };
+    }
+    return resp;
+  }
+
+  /** 防线③：同一会话以完全相同参数连续失败时升级纠错提示。
+   *
+   * 指纹 = 工具名 + 规范化参数（换任何其他调用即重置）。第 2 次起在错误前加
+   * 「第 N 次相同失败」警示并附 retry_with 模板；第 loop_guard_max 次下达停止令。
+   * 提示逐级改写——字节级相同的错误响应本身就会成为强化燃料。
+   */
+  private guarded_error(
+    skey: string,
+    name: string,
+    args: Record<string, unknown>,
+    envelope: Record<string, unknown>,
+  ): Record<string, unknown> {
+    if (!this.loop_guard) return envelope;
+    const canon = name + "\x00" + JSON.stringify(args);
+    const fingerprint = createHash("sha1").update(canon, "utf-8").digest("hex");
+    const prev = this.fail_streak.get(skey);
+    const count = prev && prev[0] === fingerprint ? prev[1] + 1 : 1;
+    this.fail_streak.set(skey, [fingerprint, count, monotonic()]);
+    if (count < 2) return envelope;
+    const out: Record<string, unknown> = { ...envelope };
+    out.repeat_count = count;
+    const base = `⚠️ 这是第 ${count} 次以完全相同的参数调用「${name}」失败。`;
+    if (count >= this.loop_guard_max) {
+      out.error =
+        base +
+        "原样重试不会成功：请立即停止重试此调用，改用其他工具或修正参数" +
+        "（参见 retry_with / candidates），或向用户说明情况并请求人工介入。";
+      out.directive = "stop";
+    } else {
+      out.error = base + String(out.error ?? "");
+      out.hint = "请直接复制 retry_with 中的参数重试，或改用其他工具/参数；不要原样重放。";
+    }
+    log.warn(`会话 ${skey} 工具 ${name} 以相同参数连续失败 ${count} 次`);
+    return out;
+  }
+
+  /** bmahs_describe：device 可选（防线①P1-4）+ 引用净化（防线②）。
+   *
+   * 未传 device 时：唯一已知设备自动选中；多台返回信息性选择清单（不报错，
+   * 不产生错误先例）；零台返回刷新提示。
+   */
+  private async tool_describe(args: Record<string, unknown>, skey: string): Promise<ContentBlock[]> {
+    let notes: sanitize.CoercedNote[] = [];
+    const ref = args.device;
+    const blank = ref === null || ref === undefined || (typeof ref === "string" && ref.trim() === "");
+    if (blank && this.describe_optional) {
+      const devs = [...this.discovery.all()].sort((a, b) => (a.id < b.id ? -1 : 1));
+      if (devs.length === 0) {
+        return this.text({
+          ok: true,
+          count: 0,
+          devices: [],
+          note: "局域网内暂无已知设备：可调用 bmahs_refresh 重新扫描后再试。",
+        });
+      }
+      if (devs.length > 1) {
+        return this.text({
+          ok: true,
+          count: devs.length,
+          devices: devs.map((d) => ({ id: d.id, name: d.name, type: Gateway.dev_type(d) })),
+          note:
+            "未指定 device 且当前有多台设备：请从上面选一台，并按 {\"device\": \"<id>\"} 传 id 字符串" +
+            `（如 {\"device\": ${JSON.stringify(devs[0]!.id)}}）重新调用。`,
+        });
+      }
+      notes.push({
+        arg: "device",
+        from: null,
+        to: devs[0]!.id,
+        note: `未指定 device，已自动选择唯一已知设备 ${devs[0]!.id}`,
+      });
+      const [, resp] = await this.raw_call(devs[0]!, { action: "describe", agent: this.agent_for(skey) });
+      return this.text(Gateway.attach_coerced(Gateway.require_ok(resp), notes));
+    }
+    const [ref2, dev_notes, err] = this.prep_device(args);
+    if (err) throw new DeviceEnvelope(err as BmahsMessage);
+    notes = dev_notes;
+    const dev = this.resolve_device(ref2);
+    await this.ensure_hello(dev);
+    const [, resp2] = await this.raw_call(dev, { action: "describe", agent: this.agent_for(skey) });
+    return this.text(Gateway.attach_coerced(Gateway.require_ok(resp2), notes));
+  }
+
+  /** 路由分发：先固定工具，再按 tool_map 路由到具体设备动作。 */
+  private async dispatch_tool(
+    name: string,
+    arguments_: Record<string, unknown>,
+    skey: string,
+  ): Promise<ContentBlock[]> {
     if (name === "bmahs_devices") return this.text(await this.tool_devices(arguments_.type));
     if (name === "bmahs_refresh") return this.text(await this.tool_refresh());
-    if (name === "bmahs_describe") {
-      const dev = this.resolve_device(arguments_.device);
-      await this.ensure_hello(dev);
-      const [, resp] = await this.raw_call(dev, { action: "describe", agent: this.agent_for(skey) });
-      return this.text(Gateway.require_ok(resp));
-    }
+    if (name === "bmahs_describe") return this.tool_describe(arguments_, skey);
     if (name === "bmahs_occupy") {
-      const dev = this.resolve_device(arguments_.device);
-      return this.text(Gateway.require_ok(Gateway.mask(await this.occupy(dev, arguments_.ttl, skey))));
+      const [ref, notes, err] = this.prep_device(arguments_);
+      if (err) throw new DeviceEnvelope(err as BmahsMessage);
+      const dev = this.resolve_device(ref);
+      let ttl: unknown = null;
+      let tnotes: sanitize.CoercedNote[] = [];
+      if (this.arg_coerce) {
+        const [v, n2, e2] = sanitize.coerce_int(arguments_.ttl, "ttl", this.auto_occupy_ttl);
+        if (e2) throw new DeviceEnvelope(e2 as BmahsMessage);
+        ttl = v;
+        tnotes = n2;
+      } else {
+        ttl = arguments_.ttl ?? null;
+      }
+      const resp = Gateway.require_ok(Gateway.mask(await this.occupy(dev, ttl as number | null, skey)));
+      return this.text(Gateway.attach_coerced(resp, [...notes, ...tnotes]));
     }
     if (name === "bmahs_release") {
-      const dev = this.resolve_device(arguments_.device);
-      return this.text(Gateway.require_ok(Gateway.mask(await this.release(dev, skey))));
+      const [ref, notes, err] = this.prep_device(arguments_);
+      if (err) throw new DeviceEnvelope(err as BmahsMessage);
+      const dev = this.resolve_device(ref);
+      const resp = Gateway.require_ok(Gateway.mask(await this.release(dev, skey)));
+      return this.text(Gateway.attach_coerced(resp, notes));
     }
     if (name === "bmahs_call") {
-      const dev = this.resolve_device(arguments_.device);
-      const action = String(arguments_.action ?? "").trim();
+      const [ref, notes, err] = this.prep_device(arguments_);
+      if (err) throw new DeviceEnvelope(err as BmahsMessage);
+      const dev = this.resolve_device(ref);
+      let action = String(arguments_.action ?? "").trim();
       if (!action) throw new GatewayError("缺少 action 参数");
-      const extra = arguments_.args;
-      if (extra !== null && extra !== undefined && (typeof extra !== "object" || Array.isArray(extra))) {
+      const hello = await this.ensure_hello(dev);
+      let op = find_op(hello, action);
+      if (!op && this.arg_coerce) {
+        // 动作名近似：只读动作自动改写；控制动作只建议、不代执行（防线②原则 3）
+        const [hit, names] = sanitize.near_match_action(hello, action);
+        if (hit !== null && READONLY_ACTIONS.has(hit)) {
+          notes.push({
+            arg: "action",
+            from: action,
+            to: hit,
+            note:
+              `动作名 ${JSON.stringify(action)} 不存在，已近似矫正为只读动作 ${JSON.stringify(hit)}`,
+          });
+          action = hit;
+          op = find_op(hello, hit);
+        } else if (hit !== null) {
+          throw new DeviceEnvelope(
+            sanitize.rich_error(
+              `设备 ${dev.id} 的操作清单中没有动作 ${JSON.stringify(action)}。` +
+                `最接近的是 ${JSON.stringify(hit)}（控制类动作，为安全起见网关不代为改写，请确认后显式调用）。`,
+              { echo: { device: dev.id, action }, retry_with: { device: dev.id, action: hit } },
+            ) as BmahsMessage,
+          );
+        } else {
+          throw new DeviceEnvelope(
+            sanitize.rich_error(`设备 ${dev.id} 的操作清单中没有动作 ${JSON.stringify(action)}。`, {
+              echo: { device: dev.id, action },
+              candidates: names.length > 0 ? names : undefined,
+              retry_with: { device: dev.id, action: names[0] ?? action },
+            }) as BmahsMessage,
+          );
+        }
+      }
+      let extra: unknown = arguments_.args;
+      if (extra !== null && extra !== undefined && (typeof extra !== "object" || Array.isArray(extra)) && !this.arg_coerce) {
         throw new GatewayError("args 必须是对象（键为该动作的参数名）");
       }
-      return this.text(
-        Gateway.require_ok(Gateway.mask(await this.send_control(dev, action, extra as BmahsMessage, skey))),
+      const anotes: sanitize.CoercedNote[] = [];
+      if (this.arg_coerce) {
+        const [a2, n2, e2] = sanitize.coerce_args_object(extra, op);
+        if (e2) throw new DeviceEnvelope(e2 as BmahsMessage);
+        extra = a2;
+        if (a2 && op) {
+          const [a3, n3] = sanitize.coerce_op_arguments(op, a2);
+          extra = a3;
+          anotes.push(...n3);
+        }
+        anotes.push(...n2);
+      }
+      const resp = Gateway.require_ok(
+        Gateway.mask(await this.send_control(dev, action, extra as BmahsMessage, skey)),
       );
+      return this.text(Gateway.attach_coerced(resp, [...notes, ...anotes]));
     }
     if (name === "bmahs_screenshot") {
-      const dev = this.resolve_device(arguments_.device);
-      return this.tool_screenshot(dev, arguments_.max_width, skey);
+      const [ref, notes, err] = this.prep_device(arguments_);
+      if (err) throw new DeviceEnvelope(err as BmahsMessage);
+      const dev = this.resolve_device(ref);
+      let max_width: unknown = arguments_.max_width;
+      if (this.arg_coerce && max_width !== null && max_width !== undefined) {
+        const [v, n2, e2] = sanitize.coerce_int(max_width, "max_width", 640);
+        if (e2) throw new DeviceEnvelope(e2 as BmahsMessage);
+        max_width = v;
+        notes.push(...n2);
+      }
+      return this.tool_screenshot(dev, max_width, skey, notes);
     }
     const entry = this.tool_map.get(name);
     if (!entry) {
@@ -813,6 +1083,10 @@ export class Gateway {
     if (!dev) throw new GatewayError(`设备 ${dev_id} 已下线，请调用 bmahs_refresh 刷新列表`);
     const hello = await this.ensure_hello(dev);
     const op = find_op(hello, action);
+    if (!op && action === "describe") {
+      // BMAHS_DEVICE_TOOLS 零参数别名：复用 describe 的可选参数实现
+      return this.tool_describe({}, skey);
+    }
     if (!op) throw new GatewayError(`设备 ${dev_id} 的操作清单中已没有 ${action}（设备能力可能已更新）`);
     const any_of = (op.any_of as string[] | undefined) ?? [];
     if (Array.isArray(any_of) && any_of.length > 0 && !any_of.some((a) => a in arguments_)) {
@@ -824,7 +1098,15 @@ export class Gateway {
         retryable: false,
       });
     }
-    return this.text(Gateway.require_ok(Gateway.mask(await this.send_control(dev, action, arguments_, skey))));
+    let payload_args = arguments_;
+    let dnotes: sanitize.CoercedNote[] = [];
+    if (this.arg_coerce) {
+      const [a2, n2] = sanitize.coerce_op_arguments(op, arguments_);
+      payload_args = a2;
+      dnotes = n2;
+    }
+    const resp = Gateway.require_ok(Gateway.mask(await this.send_control(dev, action, payload_args, skey)));
+    return this.text(Gateway.attach_coerced(resp, dnotes));
   }
 
   // ------------------------------------------------------------------ 静态工具实现
@@ -870,7 +1152,11 @@ export class Gateway {
         "控制类动作前网关会自动 occupy（默认 120 秒有限租约，可用 BMAHS_AUTO_OCCUPY_TTL 调整）并携带 token；" +
         "任务结束请 bmahs_release。ops_ready=false 的设备稍后自动就绪，或调用 bmahs_refresh。" +
         "id_conflict=true 的设备：局域网内观测到多个控制地址自称同一 id（可能是两台设备撞 id，" +
-        "也可能是同一设备多网卡），控制结果可能不确定，建议先人工核实。",
+        "也可能是同一设备多网卡），控制结果可能不确定，建议先人工核实。" +
+        "填参提醒：需要 device 参数的工具，device 直接填上面 devices[].id 的字符串本身，" +
+        `例如 {\"device\": ${JSON.stringify(sanitize.example_device_ref(this))}}；` +
+        "不要传对象或 {\"id\": \"名称\"} 映射。查单台设备状态优先用它的动态工具 " +
+        "<id>__<动作>（各设备的 tool_names 已列出），bmahs_describe 用于读取完整操作清单。",
     };
   }
 
@@ -913,7 +1199,12 @@ export class Gateway {
    * 返回 [文本元数据, JPEG 图片内容] 两个内容块，帧同时落盘到 capture_dir；
    * 设备未声明 ui 能力、未占用或流失败时抛 GatewayError / DeviceEnvelope。
    */
-  async tool_screenshot(dev: Device, max_width?: unknown, skey = "local"): Promise<ContentBlock[]> {
+  async tool_screenshot(
+    dev: Device,
+    max_width?: unknown,
+    skey = "local",
+    coerced: sanitize.CoercedNote[] = [],
+  ): Promise<ContentBlock[]> {
     const hello = await this.ensure_hello(dev);
     const op = find_op(hello, "ui.start");
     if (!op) throw new GatewayError(`设备 ${dev.id} 未声明 ui 能力（operations 中没有 ui.start），无法抓屏`);
@@ -983,6 +1274,7 @@ export class Gateway {
             codec: frame.codec === 1 ? "jpeg" : `codec-${frame.codec}`,
             saved_to: file,
             bytes: frame.payload.length,
+            ...(coerced.length > 0 ? { coerced } : {}),
           },
           null,
           2,
