@@ -11,6 +11,7 @@ BMAHS（比马斯）设备协议 ↔ MCP 网关的 **Node.js / TypeScript 实现
 - **零配置发现**：UDP 组播（`239.255.42.42:5354` / `[ff02::4242]:5354`，多网卡全 join + 自愈）+ Bonjour/mDNS 双通道；`BMAHS_STATIC_DEVICES` 静态设备表适配容器/跨网段。
 - **动态工具映射**：设备 `operations` 自动映射为 MCP 工具（`<设备id>__<动作>`），含 JSON Schema、any_of 约束与自然语言说明，无需为每类设备写适配。
 - **协议级占用安全**：控制前自动 `occupy`（有限租约）、token 按会话保管并自动携带、进程退出统一 `release`、token 递归遮蔽绝不回显。
+- **参数死循环防护**（1.3.0，默认开启）：参数净化器自动矫正畸形入参（device 传成 `{id: 名称}` 对象、数字加引号、id/动作名近似错），同参连续失败升级提示直至停止令；报错附可逐字照抄的 `retry_with` 模板。
 - **两种接入模式**：stdio（单客户端）与 Streamable HTTP（多客户端共享，Bearer Token 常量时间鉴权，占用方可追溯到 `-sN` 会话）。
 - **实验性抓屏**：声明了 `ui` 能力的设备可 `bmahs_screenshot` 抓帧（§4.9 二进制流解析）。
 
